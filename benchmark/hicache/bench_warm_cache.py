@@ -1,20 +1,14 @@
 # Adapted from benchmark/hicache/bench_serving.py and python/sglang/bench_serving.py
 
 """
-Benchmark warm-cache serving with exact shared-prefix control.
+HiCache benchmark: accumulating-cache scenario with exact shared-prefix control.
 
-This benchmark is designed for cache-focused studies where each request has a
-fixed total input length and an exactly controlled shared-prefix ratio. For each
-shared-prefix percentage, the benchmark:
+Runs a predefined sequence of phases (fill → hit) without flushing the KV cache
+between rounds. Each request has a fixed total input length and a controlled
+shared-prefix ratio. The cache is flushed exactly once at the start.
 
-1. Flushes the server KV cache.
-2. Builds prompts with an identical shared prefix and random unique suffixes.
-3. Warms only the shared prefix once.
-4. Benchmarks the full prompts through SGLang's native /generate endpoint.
-
-Compared with the existing hicache shared-prefix benchmarks, this benchmark
-provides direct control over total length, shared-prefix length, and suffix
-length at the token-id level.
+Usage:
+    python bench_warm_cache.py --bench bench --model <model> [options]
 """
 
 import argparse
