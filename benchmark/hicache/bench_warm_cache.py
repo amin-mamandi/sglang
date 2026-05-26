@@ -25,13 +25,31 @@ import time
 import warnings
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+import resource
 
 import aiohttp
 import numpy as np
 import requests
-from transformers import PreTrainedTokenizerBase
 
-from sglang.benchmark.utils import get_tokenizer, remove_prefix, set_ulimit
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
+def get_tokenizer(pretrained_model_name_or_path: str):
+    return AutoTokenizer.from_pretrained(
+        pretrained_model_name_or_path, trust_remote_code=True
+    )
+
+
+def remove_prefix(text: str, prefix: str) -> str:
+    return text[len(prefix):] if text.startswith(prefix) else text
+
+
+def set_ulimit(target_soft_limit=65535):
+    resource_type = resource.RLIMIT_NOFILE
+    current_soft, current_hard = resource.getrlimit(resource_type)
+    if current_soft < target_soft_limit:
+        try:
+            resource.setrlimit(resource_type, (target_soft_limit, current_hard))
+        except ValueError as e:
+            print(f"Fail to set RLIMIT_NOFILE: {e}")
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
 AIOHTTP_READ_BUFSIZE = 10 * 1024**2
@@ -417,6 +435,9 @@ def maybe_write_summary_jsonl(
     metrics: BenchmarkMetrics,
     output_file: Optional[str],
     benchmark_duration: float,
+    round_index: Optional[int] = None,
+    phase_label: Optional[str] = None,
+    round_start_wall_time: Optional[float] = None,
 ) -> None:
     if not output_file:
         return
@@ -464,34 +485,38 @@ def maybe_write_summary_jsonl(
         "p99_e2e_latency_ms": metrics.p99_e2e_latency_ms,
         "concurrency": metrics.concurrency,
     }
+    if round_index is not None:
+        result["round_index"] = round_index
+    if phase_label is not None:
+        result["phase_label"] = phase_label
+    if round_start_wall_time is not None:
+        result["round_start_wall_time"] = round_start_wall_time
 
     with open(output_file, "a", encoding="utf-8") as fout:
         fout.write(json.dumps(result) + "\n")
 
 
-async def benchmark_shared_prefix_pct(
+async def benchmark_one_round(
     api_url: str,
-    base_url: str,
     tokenizer: PreTrainedTokenizerBase,
     vocab_ids: List[int],
     rng: random.Random,
     pct: int,
+    round_index: int,
+    phase_label: str,
 ) -> Tuple[BenchmarkMetrics, float, int, int, int]:
+    """Run one benchmark round without flushing the cache first."""
+    round_start_wall_time = time.time()
     prefix_len = args.total_tokens * pct // 100
     suffix_len = args.total_tokens - prefix_len
 
     print(f"\n{'=' * 70}")
     print(
-        f"shared_prefix={pct}%  prefix_len={prefix_len}  "
-        f"suffix_len={suffix_len}  total={prefix_len + suffix_len}"
+        f"[story round {round_index}] phase={phase_label}  "
+        f"shared_prefix={pct}%  prefix_len={prefix_len}  suffix_len={suffix_len}"
     )
     print(f"{'=' * 70}")
 
-    print("Flushing KV cache ...")
-    flush_cache(base_url)
-    time.sleep(1)
-
-    print(f"Building {args.num_prompts} prompts ...")
     prompts = build_prompts(
         vocab_ids=vocab_ids,
         total_tokens=args.total_tokens,
@@ -517,20 +542,16 @@ async def benchmark_shared_prefix_pct(
     )
     benchmark_duration = time.perf_counter() - benchmark_start_time
 
-    failed_outputs = [output for output in outputs if not output.success]
+    failed_outputs = [o for o in outputs if not o.success]
     if failed_outputs:
         print(f"WARNING: {len(failed_outputs)}/{len(outputs)} requests failed")
-        for output in failed_outputs[:5]:
-            print(f"  {output.error[:160]}")
+        for o in failed_outputs[:5]:
+            print(f"  {o.error[:160]}")
 
-    metrics, _ = calculate_metrics(
-        outputs=outputs,
-        dur_s=benchmark_duration,
-        tokenizer=tokenizer,
-    )
+    metrics, _ = calculate_metrics(outputs=outputs, dur_s=benchmark_duration, tokenizer=tokenizer)
 
     if metrics.completed == 0:
-        raise RuntimeError("All requests failed for this shared-prefix percentage.")
+        raise RuntimeError(f"All requests failed in story round {round_index}.")
 
     print_benchmark_result(
         metrics=metrics,
@@ -547,9 +568,62 @@ async def benchmark_shared_prefix_pct(
         metrics=metrics,
         output_file=args.output_file,
         benchmark_duration=benchmark_duration,
+        round_index=round_index,
+        phase_label=phase_label,
+        round_start_wall_time=round_start_wall_time,
     )
 
     return metrics, benchmark_duration, prefix_len, suffix_len, len(outputs)
+
+
+_BENCH_SEQUENCES: Dict[str, List[Tuple[int, str, int]]] = {
+    "bench": [
+        (0,  "fill",  40),
+        (80, "hit",   40),
+        (99, "hit",   40),
+    ],
+}
+
+
+async def run_bench(
+    api_url: str,
+    base_url: str,
+    tokenizer: PreTrainedTokenizerBase,
+    vocab_ids: List[int],
+    rng: random.Random,
+    bench_name: str,
+) -> None:
+    sequence = _BENCH_SEQUENCES.get(bench_name)
+    if sequence is None:
+        raise ValueError(
+            f"Unknown bench: {bench_name!r}. "
+            f"Available: {list(_BENCH_SEQUENCES.keys())}"
+        )
+
+    total_phases = len(sequence)
+    total_duration = sum(d for _, _, d in sequence)
+    print(f"\nBench: {bench_name} — {total_phases} phases × {total_duration}s total, no cache flush between phases")
+    print("Flushing KV cache once at the very start ...")
+    flush_cache(base_url)
+    time.sleep(1)
+
+    round_idx = 0
+    for pct, phase_label, duration_s in sequence:
+        phase_end = time.perf_counter() + duration_s
+        print(f"\n{'#' * 70}")
+        print(f"PHASE: {phase_label}  pct={pct}%  duration={duration_s}s")
+        print(f"{'#' * 70}")
+        while time.perf_counter() < phase_end:
+            await benchmark_one_round(
+                api_url=api_url,
+                tokenizer=tokenizer,
+                vocab_ids=vocab_ids,
+                rng=rng,
+                pct=pct,
+                round_index=round_idx,
+                phase_label=phase_label,
+            )
+            round_idx += 1
 
 
 async def main() -> None:
@@ -606,12 +680,6 @@ async def main() -> None:
         help="Maximum number of concurrent requests.",
     )
     parser.add_argument(
-        "--pcts",
-        type=str,
-        default="0,10,20,30,40,50,60,70,80,90,92,95,97,99",
-        help="Comma-separated shared-prefix percentages to sweep.",
-    )
-    parser.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -634,6 +702,16 @@ async def main() -> None:
         type=str,
         help="Append given JSON object to the request payload. You can use this to specify additional generate params.",
     )
+    parser.add_argument(
+        "--bench",
+        type=str,
+        default=None,
+        choices=list(_BENCH_SEQUENCES.keys()),
+        help=(
+            "Accumulating-cache bench to run (no cache flush between rounds). "
+            "Choices: " + ", ".join(_BENCH_SEQUENCES.keys())
+        ),
+    )
     global args
     args = parser.parse_args()
 
@@ -643,7 +721,6 @@ async def main() -> None:
 
     base_url = args.base_url or f"http://{args.host}:{args.port}"
     api_url = f"{base_url}/generate"
-    pcts = [int(p.strip()) for p in args.pcts.split(",") if p.strip()]
     rng = random.Random(args.seed)
 
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
@@ -654,15 +731,17 @@ async def main() -> None:
     print(f"Loading tokenizer from {tokenizer_id} ...")
     print(f"Tokenizer loaded (vocab_size={len(vocab_ids)})")
 
-    for pct in pcts:
-        await benchmark_shared_prefix_pct(
-            api_url=api_url,
-            base_url=base_url,
-            tokenizer=tokenizer,
-            vocab_ids=vocab_ids,
-            rng=rng,
-            pct=pct,
-        )
+    if not args.bench:
+        raise SystemExit("--bench is required. Choices: " + ", ".join(_BENCH_SEQUENCES.keys()))
+
+    await run_bench(
+        api_url=api_url,
+        base_url=base_url,
+        tokenizer=tokenizer,
+        vocab_ids=vocab_ids,
+        rng=rng,
+        bench_name=args.bench,
+    )
 
     if args.output_file:
         print(f"JSONL results saved to {args.output_file}")

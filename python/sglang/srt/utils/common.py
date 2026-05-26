@@ -88,7 +88,10 @@ from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
 from torch.utils._contextlib import _DecoratorContextManager
-from torchvision.io import decode_jpeg
+try:
+    from torchvision.io import decode_jpeg
+except ImportError:  # pragma: no cover
+    decode_jpeg = None  # type: ignore
 from typing_extensions import Literal
 
 from sglang.srt.environ import envs
@@ -888,7 +891,7 @@ def _load_image(
     """
     if image_file != "":
         image_bytes = get_image_bytes(image_file)
-    if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
+    if is_jpeg_with_cuda(image_bytes, gpu_image_decode) and decode_jpeg is not None:
         try:
             encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
             image_tensor = decode_jpeg(encoded_image, device="cuda")

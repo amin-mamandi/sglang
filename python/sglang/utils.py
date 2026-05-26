@@ -23,7 +23,11 @@ from typing import Any, Callable, List, Optional, Tuple, Type, Union
 import numpy as np
 import pybase64
 import requests
-from IPython.display import HTML, display
+try:
+    from IPython.display import HTML, display
+except ImportError:
+    HTML = None
+    display = None
 from pydantic import BaseModel
 from tqdm import tqdm
 
@@ -448,7 +452,7 @@ def is_in_ci() -> bool:
 
 
 def print_highlight(html_content: str):
-    if is_in_ci():
+    if is_in_ci() and display is not None and HTML is not None:
         html_content = str(html_content).replace("\n", "<br>")
         display(HTML(f"<strong style='color: #00008B;'>{html_content}</strong>"))
     else:
